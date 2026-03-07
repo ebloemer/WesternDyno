@@ -470,7 +470,7 @@ void setup() {
   int halt = 500; // Delay between setup steps for stability
 
   Serial.begin(115200);
-  Interface.begin(UI_BAUD_RATE, UI_RX_PIN, UI_TX_PIN); // RX, TX pins for UART1
+  Interface.begin(UI_BAUD_RATE, SERIAL_8N1, UI_RX_PIN, UI_TX_PIN); // RX, TX pins for UART1
 
   Serial.println("Dynamometer initializing...");
   delay(halt*2);
@@ -567,7 +567,6 @@ void loop() {
   pumpControl();
   //engineRpmControl();
   recieveUICommands();
-  sendUIData();
 
   if (millis() - UIPreviousMillis >= 16) { // Send data to UI every 100ms
     sendUIData();
