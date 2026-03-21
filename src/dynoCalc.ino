@@ -38,7 +38,10 @@ float scaleFactor = 2280.f; // Calibration factor for the load cell (adjust as n
 // Pump Pins
 #define pumpPulseSensor 9 // Pump RPM sensor (magnetic pickup)
 #define flowValvePin 10      // Flow solenoid PWM
-#define pressureValvePin 11  // Pressure solenoid PWM
+#define flowValveEnablePin 11 // Flow solenoid enable pin (if needed, set HIGH to enable)
+#define pressureValvePin 12  // Pressure solenoid PWM
+#define pressureValveEnablePin 13 // Pressure solenoid enable pin (if needed, set HIGH to enable)
+
 
 #define flowValveChannel 1      // PWM channel for flow valve
 #define pressureValveChannel 2  // PWM channel for pressure valve
@@ -97,9 +100,9 @@ unsigned long enginePulse;
 unsigned long prevEnginePulse;
 int engineMagnets = 1;
 
-float engineP = 0.001;     // Proportional gain for engine RPM control
-float engineI = 0.0002;     // Integral gain for engine RPM control
-float engineD = 0.00005;    // Derivative gain for engine RPM control
+float engineP = 0.1;     // Proportional gain for engine RPM control
+float engineI = 0.02;     // Integral gain for engine RPM control
+float engineD = 0.005;    // Derivative gain for engine RPM control
 float engineIntegral = 0; // Integral term for engine RPM control
 float enginePreviousError = 0; // Previous error for engine RPM control
 float enginePreviousPreviousError = 0; // Previous previous error for delta PID
@@ -191,17 +194,23 @@ void pumpControl() {
  
   // Set flow valve (0-4095 PWM)
   if (mode == 0) { // Manual mode
+    digitalWrite(flowValveEnablePin, HIGH); // Enable flow valve
+    digitalWrite(pressureValveEnablePin, HIGH); // Enable pressure valve
     flowValveValue = map(manualFlow, 0, 100, 0, maxFlowValve);
     pressureValveValue = map(manualPressure, 0, 100, 0, maxPressureValve);
   }
   
   else if (mode == 1 && scaleConnected) { // Torque control mode
     flowValveValue = 0; // Start with flow valve closed
+    digitalWrite(flowValveEnablePin, LOW); // Disable flow valve
+    digitalWrite(pressureValveEnablePin, HIGH); // Enable pressure valve
     torqueControl();
   }
   
   else if (mode == 2) { // RPM control mode
     pressureValveValue = 0; // Start with pressure valve closed
+    digitalWrite(pressureValveEnablePin, LOW); // Disable pressure valve
+    digitalWrite(flowValveEnablePin, HIGH); // Enable flow valve
     pumpRpmControl();
   }
 
@@ -352,7 +361,7 @@ void printStatus() {
     Serial.print(torque);
     Serial.print(" - ");
     Serial.print(targetTorque);
-    Serial.print("% || Pressure Valve: ");
+    Serial.print(" || Pressure Valve: ");
     Serial.print(map(pressureValveValue, minPressureValve, maxPressureValve, 0, 100));
   }
 
@@ -494,8 +503,10 @@ void setup() {
   
   pinMode(emergencyPin, INPUT_PULLUP);
   pinMode(resetPin, INPUT_PULLDOWN);
-  pinMode(flowValveChannel, OUTPUT);
-  pinMode(pressureValveChannel, OUTPUT);
+  pinMode(flowValvePin, OUTPUT);
+  pinMode(pressureValvePin, OUTPUT);
+  pinMode(flowValveEnablePin, OUTPUT);
+  pinMode(pressureValveEnablePin, OUTPUT);
   pinMode(enginePulseSensor, INPUT_PULLDOWN);
   pinMode(pumpPulseSensor, INPUT_PULLDOWN);
   pinMode(engineThrottlePin, OUTPUT);
@@ -541,6 +552,7 @@ void setup() {
     Serial.println("HX711 detected.");
     scaleConnected = true;
     
+    digitalWrite(flowValveEnablePin, HIGH); // Enable flow valve to relieve pressure for taring
     ledcWrite(flowValveChannel, maxFlowValve); // Relieve any pressure in the system for accurate taring
     delay(2500);
 
@@ -548,6 +560,7 @@ void setup() {
     scale.tare(50); // Tare with 50 samples for better accuracy
 
     ledcWrite(flowValveChannel, flowValveValue); // Close flow valve after taring
+    digitalWrite(flowValveEnablePin, LOW); // Disable flow valve after taring
   } else {
     Serial.println("HX711 NOT detected. Torque control unavailable.");
   }
@@ -563,9 +576,9 @@ void setup() {
 }
 
 void loop() {
-  //emergencyStop(); // Check for emergency stop condition every loop
+  emergencyStop(); // Check for emergency stop condition every loop
   pumpControl();
-  //engineRpmControl();
+  engineRpmControl();
   recieveUICommands();
 
   if (millis() - UIPreviousMillis >= 16) { // Send data to UI every 100ms
