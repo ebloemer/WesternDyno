@@ -1,0 +1,72 @@
+========================================================================================
+SRC Expects from GUI:
+
+emergency,mode,manualFlow,manualPressure,targetTorque,targetRpm,targetEngineRpm
+
+bool emergency: true shutdown vs false normal op
+function used: emergencyStop()
+
+int mode: 0 manual 1 torque ctrl 2 rpm ctrl 3 variable ratio
+--> these numberings seem inconsistent
+
+int manualPressure: 0-100 range, used when mode is 0 manual
+mapped to: pressureValveValue
+
+int manualFlow: 0-100 range, used when mode is 0 manual
+mapped to: flowValveValue
+
+float targetTorque: desired torque, needs to be timestampped? used when mode is 1 torque
+
+float targetRPM: desired RPM target, needs to be timestampped? used when mode is 2?
+function used: pumpRPMControl() sprocket conversion from targetRPM 
+--> this is for the pump
+
+float targetEngineRPM: needs set values, timestamped?
+function used: engineRPMControl()
+
+primary and secondary sprocket tooth counts are probably okay to be hard coded?
+
+PID tuning also for now hard coded: pressure, flow, engine, all have their own
+
+int maxPumpRpm
+int rpmLimiterDeadband
+int engineThrottleMin
+int engineThrottleMax
+int servoMinAngle
+int servoMaxAngle
+int engineMagnets
+int pumpMagnets
+float scaleFactor
+
+are other factors, should we have these tunable?
+
+=================================================================================================
+SRC Writes to GUI:
+
+float engineRPM
+
+float pumpRpm
+
+float targetPumpRpm
+
+float torque
+
+float targetTorque
+
+float power
+
+float secondaryRpm --> what is this?
+
+float flowValveValue --> for troubleshoot?
+
+float pressureValveValue --> for troubleshoot?
+
+float engineThrottleValue
+
+bool scaleConnected --> tells if torque mode is valid
+
+bool emergency --> returns emergency state
+
+TX summary: emergency,engineRpm,targetEngineRpm,pumpRpm,targetPumpRpm,torque,targetTorque,flowValve%,pressureValve%,engineThrottle%
+
+RX summary: emergency,mode,manualFlow,manualPressure,targetTorque,targetRpm,targetEngineRpm

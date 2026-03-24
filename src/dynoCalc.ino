@@ -24,6 +24,9 @@ ledColor currentColor = OFF;
 // Runtime
 #define emergencyPin 14 // Pin to trigger emergency state (normally open switch to ground)
 #define resetPin 13 // Pin to reset from emergency state (normally open switch to ground)
+
+// PIN 13 is USED 2x MUST BE FIXED =====================================================
+
 bool emergency = false;
 unsigned long ledPreviousMillis = 0;
 unsigned long UIPreviousMillis = 0;
