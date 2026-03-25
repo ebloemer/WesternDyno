@@ -15,8 +15,8 @@ Display screen;
 // =====================================================
 // Screen size
 // =====================================================
-static const int SCREEN_W = 320;
-static const int SCREEN_H = 480;
+static const int SCREEN_W = 480; 
+static const int SCREEN_H = 320;
 static const int TOPBAR_H = 56;
 
 // =====================================================
@@ -181,6 +181,7 @@ static lv_obj_t* make_topbar(lv_obj_t* root, bool show_back, lv_event_cb_t back_
 
   lv_obj_t* title_lbl = lv_label_create(top);
   lv_label_set_text(title_lbl, title);
+  lv_obj_set_style_text_color(title_lbl, lv_color_hex(0xFFFFFF), 0);
   lv_obj_align(title_lbl, LV_ALIGN_CENTER, 0, 0);
 
   lv_obj_move_foreground(top);
@@ -814,17 +815,19 @@ static void build_live_chart() {
   scr_live_chart = lv_obj_create(nullptr);
   lv_obj_t* root = make_root(scr_live_chart);
   make_topbar(root, true, cb_back_live_dynamic, "Chart", cb_estop, "E-STOP");
-  lv_obj_t* body = make_body(root);
+  lv_obj_t* body = make_body(root,true);
 
   lbl_link_chart = make_value_label(body, "Link: --");
   lbl_chart_title = make_value_label(body, "Engine RPM Over Time");
   lbl_chart_subtitle = make_value_label(body, "Actual Engine RPM");
 
   chart = lv_chart_create(body);
-  lv_obj_set_size(chart, lv_pct(100), 300);
+  lv_obj_set_size(chart, lv_pct(100), 200);
   lv_chart_set_type(chart, LV_CHART_TYPE_LINE);
   lv_chart_set_point_count(chart, 100);
   lv_chart_set_range(chart, LV_CHART_AXIS_PRIMARY_Y, 0, 6000);
+
+  lv_obj_clear_flag(chart, LV_OBJ_FLAG_SCROLLABLE);
 
   series_a = lv_chart_add_series(chart, lv_palette_main(LV_PALETTE_BLUE), LV_CHART_AXIS_PRIMARY_Y);
   series_b = lv_chart_add_series(chart, lv_palette_main(LV_PALETTE_RED), LV_CHART_AXIS_PRIMARY_Y);
