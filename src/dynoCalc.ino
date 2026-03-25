@@ -33,9 +33,6 @@
 // ============================
 // PWM / actuator config
 // ============================
-#define flowValveChannel 1
-#define pressureValveChannel 2
-
 int flowValveFrequency = 250;
 int pressureValveFrequency = 250;
 int pwmResolution = 12;
@@ -142,10 +139,10 @@ unsigned long enginePreviousTime = 0;
 // ============================
 // Timing
 // ============================
-unsigned long uiPreviousMillis = 0;
 unsigned long statusPreviousMillis = 0;
 unsigned long sensorPreviousMillis = 0;
 unsigned long blePreviousMillis = 0;
+unsigned long g_lastBleDebugMs = 0;
 
 const unsigned long SENSOR_PERIOD_MS = 20;
 const unsigned long STATUS_PERIOD_MS = 250;
@@ -168,6 +165,30 @@ static float throttleToPct(float us) {
   const float span = float(engineThrottleMax - engineThrottleMin);
   if (span <= 0.0f) return 0.0f;
   return constrain((us - engineThrottleMin) * 100.0f / span, 0.0f, 100.0f);
+}
+
+static const char* modeToStr(uint8_t m) {
+  switch (m) {
+    case MODE_MANUAL: return "MANUAL";
+    case MODE_TORQUE: return "TORQUE";
+    case MODE_RPM:    return "RPM";
+    case MODE_CVT:    return "CVT";
+    default:          return "UNKNOWN";
+  }
+}
+
+static void printCommandPacket(const CommandPacket& pkt) {
+  Serial.println("---- CMD RX ----");
+  Serial.print("magic: 0x"); Serial.println(pkt.magic, HEX);
+  Serial.print("version: "); Serial.println(pkt.version);
+  Serial.print("emergency: "); Serial.println(pkt.emergency);
+  Serial.print("mode: "); Serial.print(pkt.mode); Serial.print(" ("); Serial.print(modeToStr(pkt.mode)); Serial.println(")");
+  Serial.print("manualFlowPct: "); Serial.println(pkt.manualFlowPct);
+  Serial.print("manualPressurePct: "); Serial.println(pkt.manualPressurePct);
+  Serial.print("targetTorque: "); Serial.println(pkt.targetTorque);
+  Serial.print("targetRpm: "); Serial.println(pkt.targetRpm);
+  Serial.print("targetEngineRpm: "); Serial.println(pkt.targetEngineRpm);
+  Serial.println("----------------");
 }
 
 void colorSet(ledColor color) {
@@ -226,23 +247,6 @@ void getTorque() {
   }
 }
 
-void absPIDControl(float error, float &integral, float &previousError,
-                   float P, float I, float D, float &outputValue,
-                   int minVal, int maxVal, unsigned long &previousTime) {
-  const unsigned long now = micros();
-  float dt = (now - previousTime) / 1000000.0f;
-  if (dt <= 0.0f) dt = 0.000001f;
-  previousTime = now;
-
-  const float proportional = P * error;
-  integral += error * I * dt;
-  integral = constrain(integral, float(minVal), float(maxVal));
-  const float derivative = D * ((error - previousError) / dt);
-
-  outputValue = constrain(proportional + integral + derivative, float(minVal), float(maxVal));
-  previousError = error;
-}
-
 void deltaPIDControl(float error, float &previousError, float &previousPreviousError,
                      float P, float I, float D, float &outputValue,
                      int minVal, int maxVal, unsigned long &previousTime) {
@@ -288,8 +292,11 @@ void torqueControl() {
 
 void pumpRpmControl() {
   getPumpRpm();
+
+  // kept exactly as requested
   targetPumpRpm = (targetRpm * primarySprocket) / float(secondarySprocket);
   targetPumpRpm = constrain(targetPumpRpm, 0.0f, float(maxPumpRpm));
+
   const float error = targetPumpRpm - pumpRpm;
 
   if (flowPreviousTime == 0 || micros() > flowPreviousTime + 1000000UL) {
@@ -345,8 +352,8 @@ void pumpControl() {
     digitalWrite(pressureValveEnablePin, LOW);
   }
 
-  ledcWrite(flowValveChannel, (uint32_t)flowValveValue);
-  ledcWrite(pressureValveChannel, (uint32_t)pressureValveValue);
+  ledcWrite(flowValvePin, (uint32_t)flowValveValue);
+  ledcWrite(pressureValvePin, (uint32_t)pressureValveValue);
 }
 
 void updateDerivedValues() {
@@ -370,51 +377,106 @@ void applyCommandPacket(const CommandPacket& pkt) {
   targetTorque = pkt.targetTorque;
   targetRpm = pkt.targetRpm;
   targetEngineRpm = pkt.targetEngineRpm;
+
+  Serial.print("[BLE][CTRL] Applied command | mode=");
+  Serial.print(modeToStr(mode));
+  Serial.print(" | targetRpm=");
+  Serial.print(targetRpm);
+  Serial.print(" | targetEngineRpm=");
+  Serial.print(targetEngineRpm);
+  Serial.print(" | emergency=");
+  Serial.println(emergency ? 1 : 0);
 }
 
 class DynoServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer* pServer) override {
     g_bleClientConnected = true;
+    Serial.println("[BLE][CTRL] Client connected");
     colorSet(BLUE);
   }
 
   void onDisconnect(BLEServer* pServer) override {
     g_bleClientConnected = false;
-    pServer->getAdvertising()->start();
+    Serial.println("[BLE][CTRL] Client disconnected");
+
+    BLEAdvertising* adv = pServer->getAdvertising();
+    adv->addServiceUUID(DYNO_SERVICE_UUID);
+    adv->setScanResponse(true);
+    adv->start();
+
+    Serial.println("[BLE][CTRL] Advertising restarted");
     colorSet(scaleConnected ? GREEN : YELLOW);
   }
 };
 
 class CommandCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic* characteristic) override {
-    std::string value = characteristic->getValue();
-    if (value.size() != sizeof(CommandPacket)) return;
+    String value = characteristic->getValue();
+    Serial.print("[BLE][CTRL] Write received, len = ");
+    Serial.println(value.length());
+
+    if (value.length() != sizeof(CommandPacket)) {
+      Serial.print("[BLE][CTRL] Bad packet size. Expected ");
+      Serial.print(sizeof(CommandPacket));
+      Serial.print(", got ");
+      Serial.println(value.length());
+      return;
+    }
 
     CommandPacket pkt;
-    memcpy(&pkt, value.data(), sizeof(pkt));
+    memcpy(&pkt, value.c_str(), sizeof(pkt));
+
+    if (!dynoCommandPacketValid(pkt)) {
+      Serial.println("[BLE][CTRL] Invalid command packet magic/version");
+      return;
+    }
+
+    printCommandPacket(pkt);
     applyCommandPacket(pkt);
   }
 };
 
 void setupBle() {
+  Serial.println("[BLE][CTRL] BLE init starting...");
+  Serial.print("[BLE][CTRL] Device name: ");
+  Serial.println(DYNO_BLE_DEVICE_NAME);
+  Serial.print("[BLE][CTRL] Service UUID: ");
+  Serial.println(DYNO_SERVICE_UUID);
+  Serial.print("[BLE][CTRL] Cmd UUID: ");
+  Serial.println(DYNO_CMD_UUID);
+  Serial.print("[BLE][CTRL] Tel UUID: ");
+  Serial.println(DYNO_TEL_UUID);
+
   BLEDevice::init(DYNO_BLE_DEVICE_NAME);
+  BLEDevice::setMTU(517);
+  Serial.println("[BLE][CTRL] Preferred MTU set to 517");
+
   g_server = BLEDevice::createServer();
   g_server->setCallbacks(new DynoServerCallbacks());
 
   BLEService* service = g_server->createService(DYNO_SERVICE_UUID);
+  Serial.println("[BLE][CTRL] Service created");
 
   g_cmdChar = service->createCharacteristic(
       DYNO_CMD_UUID,
       BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
   g_cmdChar->setCallbacks(new CommandCallbacks());
+  Serial.println("[BLE][CTRL] Command characteristic created");
 
   g_telChar = service->createCharacteristic(
       DYNO_TEL_UUID,
       BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
   g_telChar->addDescriptor(new BLE2902());
+  Serial.println("[BLE][CTRL] Telemetry characteristic created");
 
   service->start();
-  g_server->getAdvertising()->start();
+  Serial.println("[BLE][CTRL] Service started");
+
+  BLEAdvertising* adv = g_server->getAdvertising();
+  adv->addServiceUUID(DYNO_SERVICE_UUID);
+  adv->setScanResponse(true);
+  adv->start();
+  Serial.println("[BLE][CTRL] Advertising started");
 }
 
 void sendTelemetry() {
@@ -440,6 +502,22 @@ void sendTelemetry() {
     if (g_bleClientConnected) {
       g_telChar->notify();
     }
+  }
+
+  if (millis() - g_lastBleDebugMs > 1000) {
+    g_lastBleDebugMs = millis();
+    Serial.print("[BLE][CTRL] Telemetry sent | client=");
+    Serial.print(g_bleClientConnected ? "YES" : "NO");
+    Serial.print(" | mode=");
+    Serial.print(modeToStr(mode));
+    Serial.print(" | engine=");
+    Serial.print(engineRpm, 0);
+    Serial.print(" | pump=");
+    Serial.print(pumpRpm, 0);
+    Serial.print(" | tq=");
+    Serial.print(torque, 2);
+    Serial.print(" | emergency=");
+    Serial.println(emergency ? "1" : "0");
   }
 }
 
@@ -473,8 +551,8 @@ void emergencyStop() {
     pressureValveValue = 0.0f;
     engineThrottleValue = engineThrottleMin;
 
-    ledcWrite(flowValveChannel, 0);
-    ledcWrite(pressureValveChannel, 0);
+    ledcWrite(flowValvePin, 0);
+    ledcWrite(pressureValvePin, 0);
     engineThrottle.writeMicroseconds(engineThrottleMin);
 
     digitalWrite(flowValveEnablePin, LOW);
@@ -489,6 +567,7 @@ void emergencyStop() {
     if (digitalRead(emergencyPin) == HIGH && digitalRead(resetPin) == HIGH) {
       emergency = false;
       colorSet(scaleConnected ? GREEN : YELLOW);
+      Serial.println("[CTRL] Emergency cleared");
     }
   }
 }
@@ -502,11 +581,16 @@ void setup() {
   delay(300);
   Serial.println("Dyno controller starting...");
 
+  Serial.print("sizeof(CommandPacket) = ");
+  Serial.println(sizeof(CommandPacket));
+  Serial.print("sizeof(TelemetryPacket) = ");
+  Serial.println(sizeof(TelemetryPacket));
+
   maxPressureValve = int(0.98f * ((1 << pwmResolution) - 1));
   maxFlowValve = int(0.98f * ((1 << pwmResolution) - 1));
   engineThrottleValue = engineThrottleMin;
 
-  pinMode(emergencyPin, INPUT_PULLUP);   // switch pulls to GND when pressed
+  pinMode(emergencyPin, INPUT_PULLUP);
   pinMode(resetPin, INPUT_PULLDOWN);
   pinMode(flowValvePin, OUTPUT);
   pinMode(pressureValvePin, OUTPUT);
@@ -519,10 +603,10 @@ void setup() {
   digitalWrite(flowValveEnablePin, LOW);
   digitalWrite(pressureValveEnablePin, LOW);
 
-  ledcSetup(flowValveChannel, flowValveFrequency, pwmResolution);
-  ledcAttachPin(flowValvePin, flowValveChannel);
-  ledcSetup(pressureValveChannel, pressureValveFrequency, pwmResolution);
-  ledcAttachPin(pressureValvePin, pressureValveChannel);
+  ledcAttach(flowValvePin, flowValveFrequency, pwmResolution);
+  ledcAttach(pressureValvePin, pressureValveFrequency, pwmResolution);
+  ledcWrite(flowValvePin, 0);
+  ledcWrite(pressureValvePin, 0);
 
   engineThrottle.attach(engineThrottlePin, engineThrottleMin, engineThrottleMax);
   engineThrottle.writeMicroseconds(engineThrottleMin);

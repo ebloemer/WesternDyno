@@ -32,6 +32,7 @@ static bool g_scan_active = false;
 static uint32_t g_last_cmd_ms = 0;
 static uint32_t g_last_scan_ms = 0;
 static bool g_cmd_dirty = true;
+static uint32_t g_lastGuiBleDebugMs = 0;
 
 static BLEAdvertisedDevice* g_found_device = nullptr;
 static BLEClient* g_client = nullptr;
@@ -52,6 +53,8 @@ static lv_obj_t* scr_set_torque = nullptr;
 static lv_obj_t* scr_rpm = nullptr;
 static lv_obj_t* scr_set_rpm = nullptr;
 static lv_obj_t* scr_variable_ratio = nullptr;
+static lv_obj_t* scr_set_variable_engine = nullptr;
+static lv_obj_t* scr_set_variable_pump = nullptr;
 static lv_obj_t* scr_live_menu = nullptr;
 static lv_obj_t* scr_live_static = nullptr;
 static lv_obj_t* scr_live_dynamic = nullptr;
@@ -62,6 +65,10 @@ static lv_obj_t* scr_live_chart = nullptr;
 // =====================================================
 static lv_obj_t* rpm_ta = nullptr;
 static lv_obj_t* rpm_kb = nullptr;
+static lv_obj_t* variable_engine_ta = nullptr;
+static lv_obj_t* variable_engine_kb = nullptr;
+static lv_obj_t* variable_pump_ta = nullptr;
+static lv_obj_t* variable_pump_kb = nullptr;
 static lv_obj_t* tq_ta = nullptr;
 static lv_obj_t* tq_kb = nullptr;
 
@@ -102,6 +109,8 @@ static lv_obj_t* lbl_rpm_flow = nullptr;
 static lv_obj_t* lbl_rpm_throttle = nullptr;
 
 static lv_obj_t* lbl_variable_status = nullptr;
+static lv_obj_t* lbl_variable_engine = nullptr;
+static lv_obj_t* lbl_variable_pump = nullptr;
 
 static lv_obj_t* lbl_live_mode = nullptr;
 static lv_obj_t* lbl_live_engine = nullptr;
@@ -266,6 +275,17 @@ static void dyno_set_mode(uint8_t mode) {
 
 static void dyno_set_desired_rpm(float rpm) {
   g_cmd.targetRpm = rpm;
+  g_cmd.targetEngineRpm = rpm;
+  g_cmd_dirty = true;
+}
+
+static void dyno_set_desired_pump_rpm(float rpm) {
+  g_cmd.targetRpm = rpm;
+  g_cmd_dirty = true;
+}
+
+static void dyno_set_desired_engine_rpm(float rpm) {
+  g_cmd.targetEngineRpm = rpm;
   g_cmd_dirty = true;
 }
 
@@ -289,12 +309,14 @@ static void dyno_set_manual_pressure(uint16_t pct) {
 // =====================================================
 class DynoClientCallbacks : public BLEClientCallbacks {
   void onConnect(BLEClient* client) override {
+    Serial.println("[BLE][GUI] Client connected");
     g_connected = true;
     g_connecting = false;
     set_all_link_labels();
   }
 
   void onDisconnect(BLEClient* client) override {
+    Serial.println("[BLE][GUI] Client disconnected");
     g_connected = false;
     g_connecting = false;
     g_cmd_char = nullptr;
@@ -305,9 +327,25 @@ class DynoClientCallbacks : public BLEClientCallbacks {
 
 class DynoAdvertisedCallbacks : public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice device) override {
-    if (!device.haveServiceUUID()) return;
-    if (!device.isAdvertisingService(g_service_uuid)) return;
+    const bool hasUuid = device.haveServiceUUID();
+    const bool hasDynoService = hasUuid && device.isAdvertisingService(g_service_uuid);
+    const bool nameMatch = device.haveName() && String(device.getName().c_str()) == String(DYNO_BLE_DEVICE_NAME);
 
+    Serial.println("----- [BLE][GUI] Advertised device -----");
+    Serial.print("Name: ");
+    Serial.println(device.haveName() ? device.getName().c_str() : "(no name)");
+    Serial.print("Address: ");
+    Serial.println(device.getAddress().toString().c_str());
+    Serial.print("Have service UUID: ");
+    Serial.println(hasUuid ? "YES" : "NO");
+    Serial.print("Advertising dyno service: ");
+    Serial.println(hasDynoService ? "YES" : "NO");
+    Serial.print("Name matches DynoController: ");
+    Serial.println(nameMatch ? "YES" : "NO");
+
+    if (!hasDynoService && !nameMatch) return;
+
+    Serial.println("[BLE][GUI] Matching dyno device found");
     if (g_found_device) {
       delete g_found_device;
       g_found_device = nullptr;
@@ -319,19 +357,50 @@ class DynoAdvertisedCallbacks : public BLEAdvertisedDeviceCallbacks {
 };
 
 static void telemetry_notify_cb(BLERemoteCharacteristic* c, uint8_t* data, size_t length, bool isNotify) {
-  if (length != sizeof(TelemetryPacket)) return;
+  Serial.print("[BLE][GUI] Notify received, len = ");
+  Serial.println((int)length);
+  if (length != sizeof(TelemetryPacket)) {
+    Serial.print("[BLE][GUI] Bad telemetry size. Expected ");
+    Serial.print((int)sizeof(TelemetryPacket));
+    Serial.print(", got ");
+    Serial.println((int)length);
+    return;
+  }
 
   TelemetryPacket pkt;
   memcpy(&pkt, data, sizeof(pkt));
-  if (!dynoTelemetryPacketValid(pkt)) return;
+  if (!dynoTelemetryPacketValid(pkt)) {
+    Serial.println("[BLE][GUI] Invalid telemetry packet");
+    return;
+  }
 
   g_tel = pkt;
   g_tel_valid = true;
   g_tel_dirty = true;
+
+  if (millis() - g_lastGuiBleDebugMs > 1000) {
+    g_lastGuiBleDebugMs = millis();
+    Serial.print("[BLE][GUI] Telemetry OK | mode=");
+    Serial.print(dyno_mode_str(g_tel.mode));
+    Serial.print(" | engine=");
+    Serial.print(g_tel.engineRpm, 0);
+    Serial.print(" | pump=");
+    Serial.print(g_tel.pumpRpm, 0);
+    Serial.print(" | tq=");
+    Serial.print(g_tel.torque, 2);
+    Serial.print(" | emergency=");
+    Serial.println(g_tel.emergency);
+  }
 }
 
 static bool dyno_connect_to_found_device() {
   if (!g_found_device) return false;
+
+  Serial.println("[BLE][GUI] Attempting connection...");
+  Serial.print("[BLE][GUI] Device name: ");
+  Serial.println(g_found_device->haveName() ? g_found_device->getName().c_str() : "(no name)");
+  Serial.print("[BLE][GUI] Address: ");
+  Serial.println(g_found_device->getAddress().toString().c_str());
 
   g_connecting = true;
   set_all_link_labels();
@@ -346,6 +415,7 @@ static bool dyno_connect_to_found_device() {
   g_client->setClientCallbacks(new DynoClientCallbacks());
 
   if (!g_client->connect(g_found_device)) {
+    Serial.println("[BLE][GUI] Connect failed");
     g_connecting = false;
     set_all_link_labels();
     delete g_found_device;
@@ -353,8 +423,12 @@ static bool dyno_connect_to_found_device() {
     return false;
   }
 
+  g_client->setMTU(517);
+
+  Serial.println("[BLE][GUI] Connect succeeded, getting service...");
   BLERemoteService* svc = g_client->getService(g_service_uuid);
   if (!svc) {
+    Serial.println("[BLE][GUI] Service not found");
     g_client->disconnect();
     g_connecting = false;
     set_all_link_labels();
@@ -363,10 +437,12 @@ static bool dyno_connect_to_found_device() {
     return false;
   }
 
+  Serial.println("[BLE][GUI] Service found, getting characteristics...");
   g_cmd_char = svc->getCharacteristic(g_cmd_uuid);
   g_tel_char = svc->getCharacteristic(g_tel_uuid);
 
   if (!g_cmd_char || !g_tel_char) {
+    Serial.println("[BLE][GUI] Missing command or telemetry characteristic");
     g_client->disconnect();
     g_connecting = false;
     set_all_link_labels();
@@ -375,8 +451,12 @@ static bool dyno_connect_to_found_device() {
     return false;
   }
 
+  Serial.println("[BLE][GUI] Characteristics found");
   if (g_tel_char->canNotify()) {
+    Serial.println("[BLE][GUI] Registering for notify");
     g_tel_char->registerForNotify(telemetry_notify_cb);
+  } else {
+    Serial.println("[BLE][GUI] Telemetry characteristic cannot notify");
   }
 
   g_connected = true;
@@ -386,18 +466,29 @@ static bool dyno_connect_to_found_device() {
 
   delete g_found_device;
   g_found_device = nullptr;
+  Serial.println("[BLE][GUI] Dyno BLE link ready");
   return true;
 }
 
 static void dyno_ble_init() {
   dynoInitCommandPacket(g_cmd);
 
+  Serial.println("[BLE][GUI] BLE init starting...");
+  Serial.print("[BLE][GUI] Looking for service UUID: ");
+  Serial.println(DYNO_SERVICE_UUID);
+  Serial.print("[BLE][GUI] Expected device name: ");
+  Serial.println(DYNO_BLE_DEVICE_NAME);
+
   BLEDevice::init("DynoGUI");
+  BLEDevice::setMTU(517);
+
+
   BLEScan* scan = BLEDevice::getScan();
   scan->setAdvertisedDeviceCallbacks(new DynoAdvertisedCallbacks(), false);
   scan->setActiveScan(true);
   scan->setInterval(100);
   scan->setWindow(80);
+  Serial.println("[BLE][GUI] Scan configured");
 }
 
 static void dyno_send_command_packet(bool force) {
@@ -415,6 +506,7 @@ static void dyno_send_command_packet(bool force) {
 
 static void dyno_ble_task() {
   if (!g_connected && !g_connecting && !g_scan_active && !g_found_device && (millis() - g_last_scan_ms > 1000)) {
+    Serial.println("[BLE][GUI] Starting scan...");
     BLEDevice::getScan()->start(3, false);
     g_scan_active = true;
     g_last_scan_ms = millis();
@@ -474,6 +566,20 @@ static void cb_open_set_rpm(lv_event_t*) {
   go_to(scr_set_rpm);
 }
 
+static void cb_back_variable(lv_event_t*)       { go_to(scr_variable_ratio); }
+
+static void cb_open_set_variable_engine(lv_event_t*) {
+  dyno_set_mode(MODE_CVT);
+  if (variable_engine_ta) lv_textarea_set_text(variable_engine_ta, "");
+  go_to(scr_set_variable_engine);
+}
+
+static void cb_open_set_variable_pump(lv_event_t*) {
+  dyno_set_mode(MODE_CVT);
+  if (variable_pump_ta) lv_textarea_set_text(variable_pump_ta, "");
+  go_to(scr_set_variable_pump);
+}
+
 static void cb_tq_kb(lv_event_t* e) {
   lv_event_code_t code = lv_event_get_code(e);
   if (code == LV_EVENT_READY) {
@@ -495,6 +601,30 @@ static void cb_rpm_kb(lv_event_t* e) {
     go_to(scr_rpm);
   } else if (code == LV_EVENT_CANCEL) {
     go_to(scr_rpm);
+  }
+}
+
+static void cb_variable_engine_kb(lv_event_t* e) {
+  lv_event_code_t code = lv_event_get_code(e);
+  if (code == LV_EVENT_READY) {
+    dyno_set_desired_engine_rpm((float)atof(lv_textarea_get_text(variable_engine_ta)));
+    dyno_set_mode(MODE_CVT);
+    dyno_send_command_packet(true);
+    go_to(scr_variable_ratio);
+  } else if (code == LV_EVENT_CANCEL) {
+    go_to(scr_variable_ratio);
+  }
+}
+
+static void cb_variable_pump_kb(lv_event_t* e) {
+  lv_event_code_t code = lv_event_get_code(e);
+  if (code == LV_EVENT_READY) {
+    dyno_set_desired_pump_rpm((float)atof(lv_textarea_get_text(variable_pump_ta)));
+    dyno_set_mode(MODE_CVT);
+    dyno_send_command_packet(true);
+    go_to(scr_variable_ratio);
+  } else if (code == LV_EVENT_CANCEL) {
+    go_to(scr_variable_ratio);
   }
 }
 
@@ -737,7 +867,65 @@ static void build_variable_ratio() {
   lv_obj_t* body = make_body(root);
 
   lbl_link_variable = make_value_label(body, "Link: --");
-  lbl_variable_status = make_value_label(body, "Under construction");
+  lbl_variable_status = make_value_label(body, "Set pump and engine RPM separately");
+  lbl_variable_engine = make_value_label(body, "Engine RPM Target: --");
+  lbl_variable_pump = make_value_label(body, "Pump RPM Target: --");
+
+  lv_obj_t* btn_engine = lv_btn_create(body);
+  lv_obj_set_size(btn_engine, lv_pct(100), 60);
+  lv_obj_add_event_cb(btn_engine, cb_open_set_variable_engine, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* lbl_engine = lv_label_create(btn_engine);
+  lv_label_set_text(lbl_engine, "Set Engine RPM");
+  lv_obj_center(lbl_engine);
+
+  lv_obj_t* btn_pump = lv_btn_create(body);
+  lv_obj_set_size(btn_pump, lv_pct(100), 60);
+  lv_obj_add_event_cb(btn_pump, cb_open_set_variable_pump, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* lbl_pump = lv_label_create(btn_pump);
+  lv_label_set_text(lbl_pump, "Set Pump RPM");
+  lv_obj_center(lbl_pump);
+}
+
+static void build_set_variable_engine() {
+  scr_set_variable_engine = lv_obj_create(nullptr);
+  lv_obj_t* root = make_root(scr_set_variable_engine);
+  make_topbar(root, true, cb_back_variable, "Set Engine RPM", cb_estop, "E-STOP");
+  lv_obj_t* body = make_body(root);
+
+  make_value_label(body, "Enter engine RPM target:");
+
+  variable_engine_ta = lv_textarea_create(body);
+  lv_obj_set_width(variable_engine_ta, lv_pct(100));
+  lv_textarea_set_one_line(variable_engine_ta, true);
+  lv_textarea_set_placeholder_text(variable_engine_ta, "e.g. 3000");
+  lv_textarea_set_accepted_chars(variable_engine_ta, "0123456789");
+
+  variable_engine_kb = lv_keyboard_create(body);
+  lv_obj_set_size(variable_engine_kb, lv_pct(100), 180);
+  lv_keyboard_set_mode(variable_engine_kb, LV_KEYBOARD_MODE_NUMBER);
+  lv_keyboard_set_textarea(variable_engine_kb, variable_engine_ta);
+  lv_obj_add_event_cb(variable_engine_kb, cb_variable_engine_kb, LV_EVENT_ALL, nullptr);
+}
+
+static void build_set_variable_pump() {
+  scr_set_variable_pump = lv_obj_create(nullptr);
+  lv_obj_t* root = make_root(scr_set_variable_pump);
+  make_topbar(root, true, cb_back_variable, "Set Pump RPM", cb_estop, "E-STOP");
+  lv_obj_t* body = make_body(root);
+
+  make_value_label(body, "Enter pump RPM target:");
+
+  variable_pump_ta = lv_textarea_create(body);
+  lv_obj_set_width(variable_pump_ta, lv_pct(100));
+  lv_textarea_set_one_line(variable_pump_ta, true);
+  lv_textarea_set_placeholder_text(variable_pump_ta, "e.g. 2500");
+  lv_textarea_set_accepted_chars(variable_pump_ta, "0123456789");
+
+  variable_pump_kb = lv_keyboard_create(body);
+  lv_obj_set_size(variable_pump_kb, lv_pct(100), 180);
+  lv_keyboard_set_mode(variable_pump_kb, LV_KEYBOARD_MODE_NUMBER);
+  lv_keyboard_set_textarea(variable_pump_kb, variable_pump_ta);
+  lv_obj_add_event_cb(variable_pump_kb, cb_variable_pump_kb, LV_EVENT_ALL, nullptr);
 }
 
 static void build_live_menu() {
@@ -966,6 +1154,22 @@ static void gui_refresh_from_telemetry() {
     lv_label_set_text(lbl_rpm_throttle, buf);
   }
 
+  if (lbl_variable_status) {
+    char buf[96];
+    snprintf(buf, sizeof(buf), "Mode: %s", dyno_mode_str(g_tel.mode));
+    lv_label_set_text(lbl_variable_status, buf);
+  }
+  if (lbl_variable_engine) {
+    char buf[96];
+    snprintf(buf, sizeof(buf), "Engine RPM Target: %.0f | Actual: %.0f", (double)g_tel.targetEngineRpm, (double)g_tel.engineRpm);
+    lv_label_set_text(lbl_variable_engine, buf);
+  }
+  if (lbl_variable_pump) {
+    char buf[96];
+    snprintf(buf, sizeof(buf), "Pump RPM Target: %.0f | Actual: %.0f", (double)g_tel.targetPumpRpm, (double)g_tel.pumpRpm);
+    lv_label_set_text(lbl_variable_pump, buf);
+  }
+
   if (lbl_live_mode) {
     char buf[64];
     snprintf(buf, sizeof(buf), "Mode: %s", dyno_mode_str(g_tel.mode));
@@ -1027,6 +1231,8 @@ void setup() {
   build_rpm();
   build_set_rpm();
   build_variable_ratio();
+  build_set_variable_engine();
+  build_set_variable_pump();
   build_live_menu();
   build_live_static();
   build_live_dynamic();
