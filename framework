@@ -1,0 +1,263 @@
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+#include <BLE2902.h>
+
+#include "dyno_protocol.h"
+
+// ============================
+// BLE globals
+// ============================
+BLEServer* g_server = nullptr;
+BLECharacteristic* g_cmdChar = nullptr;
+BLECharacteristic* g_telChar = nullptr;
+volatile bool g_bleClientConnected = false;
+unsigned long g_lastBleDebugMs = 0;
+unsigned long blePreviousMillis = 0;
+
+const unsigned long BLE_TELEMETRY_PERIOD_MS = 50;
+
+// ============================
+// State received from UI
+// ============================
+bool emergency = false;
+bool scaleConnected = false;
+uint8_t mode = MODE_MANUAL;
+
+int manualFlow = 0;
+int manualPressure = 0;
+
+float targetTorque = 60.0f;
+float targetRpm = 4200.0f;
+float targetEngineRpm = 3800.0f;
+
+// ============================
+// State sent to UI
+// ============================
+float engineRpm = 0.0f;
+float pumpRpm = 0.0f;
+float targetPumpRpm = 0.0f;
+float torque = 0.0f;
+float flowValvePercent = 0.0f;
+float pressureValvePercent = 0.0f;
+float throttlePercent = 0.0f;
+float powerKw = 0.0f;
+
+// ============================
+// Helpers
+// ============================
+static const char* modeToStr(uint8_t m) {
+  switch (m) {
+    case MODE_MANUAL: return "MANUAL";
+    case MODE_TORQUE: return "TORQUE";
+    case MODE_RPM:    return "RPM";
+    case MODE_CVT:    return "CVT";
+    default:          return "UNKNOWN";
+  }
+}
+
+static void printCommandPacket(const CommandPacket& pkt) {
+  Serial.println("---- CMD RX ----");
+  Serial.print("magic: 0x"); Serial.println(pkt.magic, HEX);
+  Serial.print("version: "); Serial.println(pkt.version);
+  Serial.print("emergency: "); Serial.println(pkt.emergency);
+  Serial.print("mode: "); Serial.print(pkt.mode); Serial.print(" ("); Serial.print(modeToStr(pkt.mode)); Serial.println(")");
+  Serial.print("manualFlowPct: "); Serial.println(pkt.manualFlowPct);
+  Serial.print("manualPressurePct: "); Serial.println(pkt.manualPressurePct);
+  Serial.print("targetTorque: "); Serial.println(pkt.targetTorque);
+  Serial.print("targetRpm: "); Serial.println(pkt.targetRpm);
+  Serial.print("targetEngineRpm: "); Serial.println(pkt.targetEngineRpm);
+  Serial.println("----------------");
+}
+
+// ============================
+// Receive UI data
+// ============================
+void applyCommandPacket(const CommandPacket& pkt) {
+  if (!dynoCommandPacketValid(pkt)) return;
+
+  emergency = pkt.emergency != 0;
+  mode = pkt.mode;
+  manualFlow = constrain((int)pkt.manualFlowPct, 0, 100);
+  manualPressure = constrain((int)pkt.manualPressurePct, 0, 100);
+  targetTorque = pkt.targetTorque;
+  targetRpm = pkt.targetRpm;
+  targetEngineRpm = pkt.targetEngineRpm;
+
+  Serial.print("[BLE][CTRL] Applied command | mode=");
+  Serial.print(modeToStr(mode));
+  Serial.print(" | targetRpm=");
+  Serial.print(targetRpm);
+  Serial.print(" | targetEngineRpm=");
+  Serial.print(targetEngineRpm);
+  Serial.print(" | targetTorque=");
+  Serial.print(targetTorque);
+  Serial.print(" | manualFlow=");
+  Serial.print(manualFlow);
+  Serial.print(" | manualPressure=");
+  Serial.print(manualPressure);
+  Serial.print(" | emergency=");
+  Serial.println(emergency ? 1 : 0);
+}
+
+class DynoServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) override {
+    g_bleClientConnected = true;
+    Serial.println("[BLE][CTRL] Client connected");
+  }
+
+  void onDisconnect(BLEServer* pServer) override {
+    g_bleClientConnected = false;
+    Serial.println("[BLE][CTRL] Client disconnected");
+
+    BLEAdvertising* adv = pServer->getAdvertising();
+    adv->addServiceUUID(DYNO_SERVICE_UUID);
+    adv->setScanResponse(true);
+    adv->start();
+
+    Serial.println("[BLE][CTRL] Advertising restarted");
+  }
+};
+
+class CommandCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* characteristic) override {
+    String value = characteristic->getValue();
+    Serial.print("[BLE][CTRL] Write received, len = ");
+    Serial.println(value.length());
+
+    if (value.length() != sizeof(CommandPacket)) {
+      Serial.print("[BLE][CTRL] Bad packet size. Expected ");
+      Serial.print(sizeof(CommandPacket));
+      Serial.print(", got ");
+      Serial.println(value.length());
+      return;
+    }
+
+    CommandPacket pkt;
+    memcpy(&pkt, value.c_str(), sizeof(pkt));
+
+    if (!dynoCommandPacketValid(pkt)) {
+      Serial.println("[BLE][CTRL] Invalid command packet magic/version");
+      return;
+    }
+
+    printCommandPacket(pkt);
+    applyCommandPacket(pkt);
+  }
+};
+
+// ============================
+// Send data to UI
+// ============================
+void sendTelemetry() {
+  TelemetryPacket pkt{};
+  pkt.magic = DYNO_PACKET_MAGIC;
+  pkt.version = DYNO_PACKET_VERSION;
+  pkt.emergency = emergency ? 1 : 0;
+  pkt.scaleConnected = scaleConnected ? 1 : 0;
+  pkt.mode = mode;
+  pkt.engineRpm = engineRpm;
+  pkt.targetEngineRpm = targetEngineRpm;
+  pkt.pumpRpm = pumpRpm;
+  pkt.targetPumpRpm = targetPumpRpm;
+  pkt.torque = torque;
+  pkt.targetTorque = targetTorque;
+  pkt.flowValvePercent = flowValvePercent;
+  pkt.pressureValvePercent = pressureValvePercent;
+  pkt.throttlePercent = throttlePercent;
+  pkt.powerKw = powerKw;
+
+  if (g_telChar != nullptr) {
+    g_telChar->setValue((uint8_t*)&pkt, sizeof(pkt));
+    if (g_bleClientConnected) {
+      g_telChar->notify();
+    }
+  }
+
+  if (millis() - g_lastBleDebugMs > 1000) {
+    g_lastBleDebugMs = millis();
+    Serial.print("[BLE][CTRL] Telemetry sent | client=");
+    Serial.print(g_bleClientConnected ? "YES" : "NO");
+    Serial.print(" | mode=");
+    Serial.print(modeToStr(mode));
+    Serial.print(" | engine=");
+    Serial.print(engineRpm, 1);
+    Serial.print(" | pump=");
+    Serial.print(pumpRpm, 1);
+    Serial.print(" | tq=");
+    Serial.print(torque, 2);
+    Serial.print(" | emergency=");
+    Serial.println(emergency ? "1" : "0");
+  }
+}
+
+// ============================
+// BLE setup
+// ============================
+void setupBle() {
+  Serial.println("[BLE][CTRL] BLE init starting...");
+  Serial.print("[BLE][CTRL] Device name: ");
+  Serial.println(DYNO_BLE_DEVICE_NAME);
+  Serial.print("[BLE][CTRL] Service UUID: ");
+  Serial.println(DYNO_SERVICE_UUID);
+  Serial.print("[BLE][CTRL] Cmd UUID: ");
+  Serial.println(DYNO_CMD_UUID);
+  Serial.print("[BLE][CTRL] Tel UUID: ");
+  Serial.println(DYNO_TEL_UUID);
+
+  BLEDevice::init(DYNO_BLE_DEVICE_NAME);
+  BLEDevice::setMTU(517);
+  Serial.println("[BLE][CTRL] Preferred MTU set to 517");
+
+  g_server = BLEDevice::createServer();
+  g_server->setCallbacks(new DynoServerCallbacks());
+
+  BLEService* service = g_server->createService(DYNO_SERVICE_UUID);
+  Serial.println("[BLE][CTRL] Service created");
+
+  g_cmdChar = service->createCharacteristic(
+      DYNO_CMD_UUID,
+      BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  g_cmdChar->setCallbacks(new CommandCallbacks());
+  Serial.println("[BLE][CTRL] Command characteristic created");
+
+  g_telChar = service->createCharacteristic(
+      DYNO_TEL_UUID,
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  g_telChar->addDescriptor(new BLE2902());
+  Serial.println("[BLE][CTRL] Telemetry characteristic created");
+
+  service->start();
+  Serial.println("[BLE][CTRL] Service started");
+
+  BLEAdvertising* adv = g_server->getAdvertising();
+  adv->addServiceUUID(DYNO_SERVICE_UUID);
+  adv->setScanResponse(true);
+  adv->start();
+  Serial.println("[BLE][CTRL] Advertising started");
+}
+
+// ============================
+// Arduino
+// ============================
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  Serial.println("Dyno BLE bridge starting...");
+  Serial.print("sizeof(CommandPacket) = ");
+  Serial.println(sizeof(CommandPacket));
+  Serial.print("sizeof(TelemetryPacket) = ");
+  Serial.println(sizeof(TelemetryPacket));
+
+  dynoInitCommandPacket(*(CommandPacket*)nullptr); // remove if you dislike this line
+  setupBle();
+}
+
+void loop() {
+  if (millis() - blePreviousMillis >= BLE_TELEMETRY_PERIOD_MS) {
+    blePreviousMillis = millis();
+    sendTelemetry();
+  }
+}
