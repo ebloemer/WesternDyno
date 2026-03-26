@@ -3,12 +3,94 @@
 #include <ESP32Servo.h>
 #include <Adafruit_Neopixel.h>
 #include <HardwareSerial.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 
-// Setting up serial to UI
-HardwareSerial Interface(1); // Use UART1 (pins 17 and 18 for S3)
-#define UI_BAUD_RATE 115200
-#define UI_RX_PIN 17
-#define UI_TX_PIN 18
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+#define BLE_DEVICE_NAME "Dyno-ESP32"
+
+static BLECharacteristic* txCharacteristic = nullptr;
+static bool bleClientConnected = false;
+
+String bleRxLine = "";
+bool bleCommandReady = false;
+
+// Nordic UART-style UUIDs
+#define SERVICE_UUID "0000DYN0-0000-0000-0000-000000000001"
+#define RX_UUID      "0000DYN0-0000-0000-0000-000000000002"
+#define TX_UUID      "0000DYN0-0000-0000-0000-000000000003"
+
+class ServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) override {
+    bleClientConnected = true;
+  }
+
+  void onDisconnect(BLEServer* pServer) override {
+    bleClientConnected = false;
+    BLEDevice::startAdvertising();
+  }
+};
+
+class RxCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* pCharacteristic) override {
+    std::string rxValue = pCharacteristic->getValue();
+
+    if (!rxValue.empty()) {
+      for (size_t i = 0; i < rxValue.length(); i++) {
+        char c = rxValue[i];
+
+        if (c == '\n') {
+          bleCommandReady = true;
+        } else if (c != '\r') {
+          bleRxLine += c;
+        }
+      }
+    }
+  }
+};
+
+void setupBLE() {
+  BLEDevice::init(BLE_DEVICE_NAME);
+
+  BLEServer* pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new ServerCallbacks());
+
+  BLEService* pService = pServer->createService(SERVICE_UUID);
+
+  txCharacteristic = pService->createCharacteristic(
+    TX_UUID,
+    BLECharacteristic::PROPERTY_NOTIFY
+  );
+  txCharacteristic->addDescriptor(new BLE2902());
+
+  BLECharacteristic* rxCharacteristic = pService->createCharacteristic(
+    RX_UUID,
+    BLECharacteristic::PROPERTY_WRITE |
+    BLECharacteristic::PROPERTY_WRITE_NR
+  );
+  rxCharacteristic->setCallbacks(new RxCallbacks());
+
+  pService->start();
+
+  BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->start();
+
+  Serial.println("BLE interface ready");
+}
+
+void bleSendLine(const String& msg) {
+  if (!bleClientConnected || txCharacteristic == nullptr) return;
+
+  txCharacteristic->setValue((uint8_t*)msg.c_str(), msg.length());
+  txCharacteristic->notify();
+}
 
 // LED Properties
 #define LED_PIN 48
@@ -16,15 +98,14 @@ HardwareSerial Interface(1); // Use UART1 (pins 17 and 18 for S3)
 
 Adafruit_NeoPixel led(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 HX711 scale;
-Servo engineThrottle; // Using Servo library for throttle control (0-180 degrees)
 
 enum ledColor { OFF, RED, YELLOW, GREEN, BLUE }; // LED color states
 ledColor currentColor = OFF;
 
 // Runtime
-#define emergencyPin 14 // Pin to trigger emergency state (normally open switch to ground)
-#define resetPin 13 // Pin to reset from emergency state (normally open switch to ground)
-bool emergency = false;
+#define emergencyPin 1 // Pin to trigger emergency state (normally open switch to ground)
+#define resetPin 2 // Pin to reset from emergency state (normally open switch to ground)
+bool emergency = true; // Start in emergency state until reset is pressed
 unsigned long ledPreviousMillis = 0;
 unsigned long UIPreviousMillis = 0;
 unsigned long PIDPreviousMillis = 0;
@@ -45,6 +126,7 @@ float scaleFactor = 2280.f; // Calibration factor for the load cell (adjust as n
 
 #define flowValveChannel 1      // PWM channel for flow valve
 #define pressureValveChannel 2  // PWM channel for pressure valve
+#define engineThrottleChannel 3    // PWM channel for engine throttle
 
 // Engine Pins
 #define enginePulseSensor 6
@@ -80,9 +162,9 @@ float pressurePreviousError = 0; // Previous error for pressure control
 float pressurePreviousPreviousError = 0; // Previous previous error for delta PID
 unsigned long pressurePreviousTime = 0; // Previous time for pressure control PID
 
-float flowP = 0.1;     // Proportional gain for flow control
-float flowI = 0.025;     // Integral gain for flow control
-float flowD = 0.01;    // Derivative gain for flow control
+float flowP = 0.25;     // Proportional gain for flow control
+float flowI = 0.0625;     // Integral gain for flow control
+float flowD = 0.025;    // Derivative gain for flow control
 float flowIntegral = 0; // Integral term for flow control
 float flowPreviousError = 0; // Previous error for flow control
 float flowPreviousPreviousError = 0; // Previous previous error for delta PID
@@ -90,8 +172,10 @@ unsigned long flowPreviousTime = 0; // Previous time for flow control PID
 
 // Engine RPM variables:
 int engineThrottleMin = 500;       // minimum throttle command %
-int engineThrottleMax = 2500;     // maximum throttle command %
+int engineThrottleMax = 1200;     // maximum throttle command %
 float engineThrottleValue = engineThrottleMin;     // PID output, 0-100%
+
+int engineThrottleFrequency = 150; // PWM frequency for engine throttle (servo control)
 
 int servoMinAngle = 20;              // actual closed throttle position
 int servoMaxAngle = 110;             // actual full throttle position
@@ -274,6 +358,13 @@ void pumpRpmControl() {
                   minFlowValve, maxFlowValve, flowPreviousTime);
 }
 
+uint32_t engineDuty(uint32_t pulse) {
+  uint32_t maxDuty = (1 << pwmResolution) - 1;
+  uint32_t period_us = 1000000UL / engineThrottleFrequency;
+  
+  return (pulse * maxDuty) / period_us;
+}
+
 // PID control function for engine RPM control
 void engineRpmControl() {
   getEngineRpm(); // Update engine RPM reading
@@ -294,7 +385,7 @@ void engineRpmControl() {
                   engineP, engineI, engineD, engineThrottleValue,
                   engineThrottleMin, engineThrottleMax, enginePreviousTime);
 
-  engineThrottle.writeMicroseconds((int)engineThrottleValue); // Map throttle value to 0-100% for servo write
+  ledcWrite(engineThrottleChannel, engineDuty(engineThrottleValue)); // Map throttle value to 0-100% for servo write
 }
 
 void absPIDControl(float error, float &integral, float &previousError, 
@@ -381,59 +472,62 @@ void printStatus() {
 }
 
 void sendUIData() {
-  // Send data in a simple CSV format for easy parsing on the UI side
-  Interface.print(emergency ? "1" : "0"); // Emergency status
-  Interface.print(",");
-  Interface.print(engineRpm);
-  Interface.print(",");
-  Interface.print(targetEngineRpm);
-  Interface.print(",");
-  Interface.print(pumpRpm);
-  Interface.print(",");
-  Interface.print(targetPumpRpm);
-  Interface.print(",");
-  Interface.print(torque);
-  Interface.print(",");
-  Interface.print(targetTorque);
-  Interface.print(",");
-  Interface.print(map(flowValveValue, 0, maxFlowValve, 0, 100));
-  Interface.print(",");
-  Interface.print(map(pressureValveValue, 0, maxPressureValve, 0, 100));
-  Interface.print(",");
-  Interface.println(map(engineThrottleValue, engineThrottleMin, engineThrottleMax, 0, 100));
+  String msg = "";
+  msg += (emergency ? "1" : "0");
+  msg += ",";
+  msg += String(engineRpm);
+  msg += ",";
+  msg += String(targetEngineRpm);
+  msg += ",";
+  msg += String(pumpRpm);
+  msg += ",";
+  msg += String(targetPumpRpm);
+  msg += ",";
+  msg += String(torque);
+  msg += ",";
+  msg += String(targetTorque);
+  msg += ",";
+  msg += String(map(flowValveValue, 0, maxFlowValve, 0, 100));
+  msg += ",";
+  msg += String(map(pressureValveValue, 0, maxPressureValve, 0, 100));
+  msg += ",";
+  msg += String(map(engineThrottleValue, engineThrottleMin, engineThrottleMax, 0, 100));
+
+  bleSendLine(msg);
 }
 
 void recieveUICommands() {
-  // Check if data is available on the serial port
-  if (Interface.available() > 0) {
-    String command = Interface.readStringUntil('\n'); // Read until newline
-    // Parse command and update parameters accordingly
-    // Expected format: "EMERGENCY_STATUS,MODE,MANUAL_FLOW,MANUAL_PRESSURE,TARGET_TORQUE,TARGET_RPM,TARGET_ENGINE_RPM"
-    int index = 0;
-    String tokens[7];
-    while (command.length() > 0 && index < 7) {
-      int commaIndex = command.indexOf(',');
-      if (commaIndex == -1) {
-        tokens[index++] = command; // Last token
-        break;
-      } else {
-        tokens[index++] = command.substring(0, commaIndex);
-        command = command.substring(commaIndex + 1);
-      }
+  if (!bleCommandReady) return;
+
+  String command = bleRxLine;
+  bleRxLine = "";
+  bleCommandReady = false;
+
+  int index = 0;
+  String tokens[7];
+
+  while (command.length() > 0 && index < 7) {
+    int commaIndex = command.indexOf(',');
+    if (commaIndex == -1) {
+      tokens[index++] = command;
+      break;
+    } else {
+      tokens[index++] = command.substring(0, commaIndex);
+      command = command.substring(commaIndex + 1);
     }
-    
-    if (index >= 1) emergency = tokens[0].toInt() == 1; // Set emergency flag based on first token
-    if (index >= 2) mode = tokens[1].toInt();
-    if (index >= 3) manualFlow = tokens[2].toInt();
-    if (index >= 4) manualPressure = tokens[3].toInt();
-    if (index >= 5) targetTorque = tokens[4].toFloat();
-    if (index >= 6) targetRpm = tokens[5].toFloat();
-    if (index >= 7) targetEngineRpm = tokens[6].toFloat();
   }
+
+  if (index >= 1) emergency = tokens[0].toInt() == 1;
+  if (index >= 2) mode = tokens[1].toInt();
+  if (index >= 3) manualFlow = tokens[2].toInt();
+  if (index >= 4) manualPressure = tokens[3].toInt();
+  if (index >= 5) targetTorque = tokens[4].toFloat();
+  if (index >= 6) targetRpm = tokens[5].toFloat();
+  if (index >= 7) targetEngineRpm = tokens[6].toFloat();
 }
 
 void emergencyStop() {
-  while(digitalRead(emergencyPin) == HIGH || emergency) {
+  while(digitalRead(emergencyPin) == LOW || emergency) {
     emergency = true; // Set emergency flag to stay in loop until reset
 
     Serial.println("EMERGENCY STOP ENGAGED!");
@@ -444,7 +538,7 @@ void emergencyStop() {
 
     ledcWrite(flowValveChannel, flowValveValue);
     ledcWrite(pressureValveChannel, pressureValveValue);
-    engineThrottle.write(engineThrottleValue);
+    ledcWrite(engineThrottleChannel, engineDuty(engineThrottleValue));
 
     flowIntegral = 0;
     pressureIntegral = 0;
@@ -464,7 +558,7 @@ void emergencyStop() {
 
     delay(500);
 
-    if(digitalRead(emergencyPin) == LOW && digitalRead(resetPin) == HIGH) { // Check if emergency switch is still engaged
+    if(digitalRead(emergencyPin) == HIGH && digitalRead(resetPin) == LOW) { // Check if emergency switch is still engaged
       emergency = false;
       colorSet(OFF); // Turn off LED when exiting emergency state
     }
@@ -478,8 +572,9 @@ void setup() {
   
   int halt = 500; // Delay between setup steps for stability
 
+  
   Serial.begin(115200);
-  Interface.begin(UI_BAUD_RATE, SERIAL_8N1, UI_RX_PIN, UI_TX_PIN); // RX, TX pins for UART1
+  setupBLE();
 
   Serial.println("Dynamometer initializing...");
   delay(halt*2);
@@ -502,16 +597,14 @@ void setup() {
   }
   
   pinMode(emergencyPin, INPUT_PULLUP);
-  pinMode(resetPin, INPUT_PULLDOWN);
+  pinMode(resetPin, INPUT_PULLUP);
   pinMode(flowValvePin, OUTPUT);
   pinMode(pressureValvePin, OUTPUT);
   pinMode(flowValveEnablePin, OUTPUT);
   pinMode(pressureValveEnablePin, OUTPUT);
-  pinMode(enginePulseSensor, INPUT_PULLDOWN);
-  pinMode(pumpPulseSensor, INPUT_PULLDOWN);
+  pinMode(enginePulseSensor, INPUT_PULLUP);
+  pinMode(pumpPulseSensor, INPUT_PULLUP);
   pinMode(engineThrottlePin, OUTPUT);
-
-  engineThrottle.attach(engineThrottlePin, engineThrottleMin, engineThrottleMax);
 
   delay(halt);
 
@@ -519,8 +612,10 @@ void setup() {
   Serial.println("Setting up PWM channels...");
   ledcSetup(flowValveChannel, flowValveFrequency, pwmResolution);
   ledcSetup(pressureValveChannel, pressureValveFrequency, pwmResolution);
+  ledcSetup(engineThrottleChannel, engineThrottleFrequency, pwmResolution); // 150 Hz for servo control
   ledcAttachPin(flowValvePin, flowValveChannel);
   ledcAttachPin(pressureValvePin, pressureValveChannel);
+  ledcAttachPin(engineThrottlePin, engineThrottleChannel);
 
   delay(halt);
 
@@ -569,8 +664,6 @@ void setup() {
 
   // Finalize setup
   Serial.println("Dynamometer initialized!");
-  
-  colorSet(GREEN); // GREEN for ready
 
   delay(halt);
 }
