@@ -8,7 +8,7 @@
 #include <BLEClient.h>
 #include <BLERemoteCharacteristic.h>
 #include <SPI.h>
-#include <SD.h>
+#include "sd_read_write.h"
 
 #include "dyno_protocol.h"
 
@@ -29,6 +29,7 @@ static const int TOPBAR_H = 56;
 #define SD_VSPI_MISO 19
 #define SD_VSPI_MOSI 23
 
+static SPIClass sd_spi(VSPI);
 
 // =====================================================
 // GUI + BLE state
@@ -51,10 +52,8 @@ static uint32_t g_lastGuiBleDebugMs = 0;
 static bool g_sd_ready = false;
 static bool g_sd_bus_started = false;
 static bool g_recording = false;
-static File g_record_file;
 static String g_record_filename = "";
 static uint32_t g_record_start_ms = 0;
-static uint32_t g_last_log_flush_ms = 0;
 static uint32_t g_last_log_sample_ms = 0;
 
 static BLEAdvertisedDevice* g_found_device = nullptr;
@@ -234,44 +233,50 @@ static void refresh_record_labels() {
 static bool sd_logger_init() {
   if (g_sd_ready) return true;
 
-  // Lazy-init SD only when needed so boot/display stay stable.
-  // Keep chip selects inactive before touching the SD bus.
-  pinMode(SD_VSPI_SS, OUTPUT);
-  digitalWrite(SD_VSPI_SS, HIGH);
-
-  #ifdef TFT_CS
-    pinMode(TFT_CS, OUTPUT);
-    digitalWrite(TFT_CS, HIGH);
-  #endif
+  if (!g_sd_bus_started) {
+    sd_spi.begin(SD_VSPI_SCK, SD_VSPI_MISO, SD_VSPI_MOSI, SD_VSPI_SS);
+    g_sd_bus_started = true;
+    delay(10);
+  }
 
   Serial.println("[SD] Initializing SD card...");
-
-  // Start the SPI bus once. Do NOT call SPI.end() here because the display uses SPI too.
-  if (!g_sd_bus_started) {
-    SPI.begin(SD_VSPI_SCK, SD_VSPI_MISO, SD_VSPI_MOSI, SD_VSPI_SS);
-    g_sd_bus_started = true;
-    delay(5);
+  if (!SD.begin(SD_VSPI_SS, sd_spi)) {
+    Serial.println(F("[SD] SD.begin failed!"));
+    g_sd_ready = false;
+    refresh_record_labels();
+    return false;
   }
 
-  g_sd_ready = SD.begin(SD_VSPI_SS, SPI);
+  Serial.println("\r\n[SD] Initialisation done.");
+  uint8_t cardType = SD.cardType();
+  if (cardType == CARD_NONE) {
+    Serial.println("[SD] No SD card attached");
+    g_sd_ready = false;
+    refresh_record_labels();
+    return false;
+  }
 
-  if (g_sd_ready) {
-    Serial.println("[SD] SD card ready");
+  Serial.print("[SD] SD Card Type: ");
+  if (cardType == CARD_MMC) {
+    Serial.println("MMC");
+  } else if (cardType == CARD_SD) {
+    Serial.println("SDSC");
+  } else if (cardType == CARD_SDHC) {
+    Serial.println("SDHC");
   } else {
-    Serial.println("[SD] SD.begin failed");
+    Serial.println("UNKNOWN");
   }
 
+  uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+  Serial.printf("[SD] SD Card Size: %lluMB\n", cardSize);
+
+  g_sd_ready = true;
   refresh_record_labels();
-  return g_sd_ready;
+  return true;
 }
 
 static void stop_recording() {
-  if (g_record_file) {
-    g_record_file.flush();
-    g_record_file.close();
-  }
   g_recording = false;
-  g_last_log_flush_ms = 0;
   Serial.println("[SD] Recording stopped");
   refresh_record_labels();
 }
@@ -288,25 +293,16 @@ static bool start_recording_file(const char* requested_name) {
   }
 
   g_record_filename = sanitize_csv_name(requested_name);
+
   if (SD.exists(g_record_filename.c_str())) {
-    SD.remove(g_record_filename.c_str());
+    deleteFile(SD, g_record_filename.c_str());
   }
 
-  g_record_file = SD.open(g_record_filename.c_str(), FILE_WRITE);
-  if (!g_record_file) {
-    Serial.print("[SD] Failed to open file: ");
-    Serial.println(g_record_filename);
-    g_record_filename = "";
-    refresh_record_labels();
-    return false;
-  }
-
-  g_record_file.println("timestamp_ms,record_elapsed_ms,connected,mode,engine_rpm,target_engine_rpm,pump_rpm,target_pump_rpm,torque_nm,target_torque_nm,power_kw,flow_valve_percent,pressure_valve_percent,throttle_percent,scale_connected,emergency,manual_flow_cmd_pct,manual_pressure_cmd_pct");
-  g_record_file.flush();
+  writeFile(SD, g_record_filename.c_str(),
+    "timestamp_ms,record_elapsed_ms,connected,mode,engine_rpm,target_engine_rpm,pump_rpm,target_pump_rpm,torque_nm,target_torque_nm,power_kw,flow_valve_percent,pressure_valve_percent,throttle_percent,scale_connected,emergency,manual_flow_cmd_pct,manual_pressure_cmd_pct\r\n");
 
   g_recording = true;
   g_record_start_ms = millis();
-  g_last_log_flush_ms = g_record_start_ms;
   g_last_log_sample_ms = 0;
 
   Serial.print("[SD] Recording started: ");
@@ -316,36 +312,35 @@ static bool start_recording_file(const char* requested_name) {
 }
 
 static void sd_log_telemetry_if_needed() {
-  if (!g_recording || !g_record_file || !g_tel_valid) return;
+  if (!g_recording || !g_tel_valid || !g_sd_ready || g_record_filename.length() == 0) return;
 
   const uint32_t now = millis();
   if (now - g_last_log_sample_ms < 100) return;
   g_last_log_sample_ms = now;
-  g_record_file.printf("%lu,%lu,%u,%u,%.3f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%u,%u,%u,%u\r\n",
-                       (unsigned long)now,
-                       (unsigned long)(now - g_record_start_ms),
-                       g_connected ? 1 : 0,
-                       (unsigned)g_tel.mode,
-                       (double)g_tel.engineRpm,
-                       (double)g_tel.targetEngineRpm,
-                       (double)g_tel.pumpRpm,
-                       (double)g_tel.targetPumpRpm,
-                       (double)g_tel.torque,
-                       (double)g_tel.targetTorque,
-                       (double)g_tel.powerKw,
-                       (double)g_tel.flowValvePercent,
-                       (double)g_tel.pressureValvePercent,
-                       (double)g_tel.throttlePercent,
-                       g_tel.scaleConnected ? 1 : 0,
-                       g_tel.emergency ? 1 : 0,
-                       (unsigned)g_cmd.manualFlowPct,
-                       (unsigned)g_cmd.manualPressurePct);
 
-  if (now - g_last_log_flush_ms >= 1000) {
-    g_record_file.flush();
-    g_last_log_flush_ms = now;
-  }
+  char line[320];
+  snprintf(line, sizeof(line),
+           "%lu,%lu,%u,%u,%.3f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%u,%u,%u,%u\r\n",
+           (unsigned long)now,
+           (unsigned long)(now - g_record_start_ms),
+           g_connected ? 1 : 0,
+           (unsigned)g_tel.mode,
+           (double)g_tel.engineRpm,
+           (double)g_tel.targetEngineRpm,
+           (double)g_tel.pumpRpm,
+           (double)g_tel.targetPumpRpm,
+           (double)g_tel.torque,
+           (double)g_tel.targetTorque,
+           (double)g_tel.powerKw,
+           (double)g_tel.flowValvePercent,
+           (double)g_tel.pressureValvePercent,
+           (double)g_tel.throttlePercent,
+           g_tel.scaleConnected ? 1 : 0,
+           g_tel.emergency ? 1 : 0,
+           (unsigned)g_cmd.manualFlowPct,
+           (unsigned)g_cmd.manualPressurePct);
 
+  appendFile(SD, g_record_filename.c_str(), line);
   refresh_record_labels();
 }
 
