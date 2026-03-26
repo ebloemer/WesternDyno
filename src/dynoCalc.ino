@@ -16,7 +16,7 @@
 #define LED_COUNT 1
 
 #define emergencyPin 14
-#define resetPin 15   // moved off pin 13 to avoid conflict with pressureValveEnablePin
+#define resetPin 15
 
 #define DOUT 4
 #define CLK 5
@@ -61,6 +61,7 @@ ledColor currentColor = OFF;
 bool emergency = false;
 bool scaleConnected = false;
 int mode = MODE_RPM;
+int g_lastCommandedMode = MODE_RPM;
 
 int manualPressure = 0;
 int manualFlow = 0;
@@ -148,6 +149,12 @@ const unsigned long SENSOR_PERIOD_MS = 20;
 const unsigned long STATUS_PERIOD_MS = 250;
 const unsigned long BLE_TELEMETRY_PERIOD_MS = 50;
 
+#define FAKE_TELEMETRY_TEST 1
+
+#if FAKE_TELEMETRY_TEST
+unsigned long fakePreviousMs = 0;
+#endif
+
 // ============================
 // Helpers
 // ============================
@@ -189,6 +196,11 @@ static void printCommandPacket(const CommandPacket& pkt) {
   Serial.print("targetRpm: "); Serial.println(pkt.targetRpm);
   Serial.print("targetEngineRpm: "); Serial.println(pkt.targetEngineRpm);
   Serial.println("----------------");
+}
+
+static float fakeFirstOrder(float current, float target, float ratePerSec, float dt) {
+  float alpha = constrain(ratePerSec * dt, 0.0f, 1.0f);
+  return current + (target - current) * alpha;
 }
 
 void colorSet(ledColor color) {
@@ -293,7 +305,6 @@ void torqueControl() {
 void pumpRpmControl() {
   getPumpRpm();
 
-  // kept exactly as requested
   targetPumpRpm = (targetRpm * primarySprocket) / float(secondarySprocket);
   targetPumpRpm = constrain(targetPumpRpm, 0.0f, float(maxPumpRpm));
 
@@ -360,6 +371,68 @@ void updateDerivedValues() {
   powerKw = (torque * pumpRpm * 2.0f * PI / 60.0f) / 1000.0f;
 }
 
+#if FAKE_TELEMETRY_TEST
+void updateFakeTelemetry(float dt) {
+  scaleConnected = true;
+
+  const float throttlePct = throttleToPct(engineThrottleValue) / 100.0f;
+  const float flowPct = pwmToPct(flowValveValue, maxFlowValve) / 100.0f;
+  const float pressurePct = pwmToPct(pressureValveValue, maxPressureValve) / 100.0f;
+
+  float desiredEngine = engineRpm;
+  float desiredPump = pumpRpm;
+  float desiredTorque = torque;
+
+  switch (mode) {
+    case MODE_MANUAL:
+      desiredEngine = 900.0f + throttlePct * 5200.0f;
+      desiredPump = flowPct * float(maxPumpRpm);
+      desiredTorque = 4.0f + pressurePct * 90.0f + flowPct * 8.0f;
+      break;
+
+    case MODE_TORQUE:
+      desiredEngine = 1000.0f + throttlePct * 5000.0f;
+      desiredPump = 300.0f + pressurePct * float(maxPumpRpm - 300);
+      desiredTorque = 8.0f + pressurePct * 72.0f;
+      break;
+
+    case MODE_RPM:
+      desiredEngine = 900.0f + throttlePct * 5200.0f;
+      desiredPump = flowPct * float(maxPumpRpm);
+      desiredTorque = 6.0f + 0.018f * desiredPump + 0.010f * pressurePct * 100.0f;
+      break;
+
+    case MODE_CVT:
+      desiredEngine = 900.0f + throttlePct * 5200.0f;
+      desiredPump = flowPct * float(maxPumpRpm);
+      desiredTorque = 8.0f + 0.020f * desiredPump + pressurePct * 20.0f;
+      break;
+
+    default:
+      break;
+  }
+
+  if (emergency) {
+    desiredEngine = 0.0f;
+    desiredPump = 0.0f;
+    desiredTorque = 0.0f;
+  }
+
+  engineRpm = fakeFirstOrder(engineRpm, constrain(desiredEngine, 0.0f, 6500.0f), 3.0f, dt);
+  pumpRpm = fakeFirstOrder(pumpRpm, constrain(desiredPump, 0.0f, float(maxPumpRpm)), 4.0f, dt);
+  torque = fakeFirstOrder(torque, constrain(desiredTorque, 0.0f, 120.0f), 3.5f, dt);
+
+  if (mode == MODE_CVT) {
+    targetPumpRpm = constrain(targetPumpRpm, 0.0f, float(maxPumpRpm));
+  } else {
+    targetPumpRpm = (targetRpm * primarySprocket) / float(secondarySprocket);
+    targetPumpRpm = constrain(targetPumpRpm, 0.0f, float(maxPumpRpm));
+  }
+
+  updateDerivedValues();
+}
+#endif
+
 void resetControllers() {
   flowIntegral = pressureIntegral = engineIntegral = 0.0f;
   flowPreviousError = pressurePreviousError = enginePreviousError = 0.0f;
@@ -371,12 +444,21 @@ void applyCommandPacket(const CommandPacket& pkt) {
   if (!dynoCommandPacketValid(pkt)) return;
 
   emergency = pkt.emergency != 0;
-  mode = pkt.mode;
+
+  int newMode = pkt.mode;
+  bool modeChanged = (newMode != mode);
+  mode = newMode;
+  g_lastCommandedMode = newMode;
+
   manualFlow = constrain((int)pkt.manualFlowPct, 0, 100);
   manualPressure = constrain((int)pkt.manualPressurePct, 0, 100);
   targetTorque = pkt.targetTorque;
   targetRpm = pkt.targetRpm;
   targetEngineRpm = pkt.targetEngineRpm;
+
+  if (modeChanged) {
+    resetControllers();
+  }
 
   Serial.print("[BLE][CTRL] Applied command | mode=");
   Serial.print(modeToStr(mode));
@@ -384,6 +466,12 @@ void applyCommandPacket(const CommandPacket& pkt) {
   Serial.print(targetRpm);
   Serial.print(" | targetEngineRpm=");
   Serial.print(targetEngineRpm);
+  Serial.print(" | targetTorque=");
+  Serial.print(targetTorque);
+  Serial.print(" | manualFlow=");
+  Serial.print(manualFlow);
+  Serial.print(" | manualPressure=");
+  Serial.print(manualPressure);
   Serial.print(" | emergency=");
   Serial.println(emergency ? 1 : 0);
 }
@@ -523,13 +611,7 @@ void sendTelemetry() {
 
 void printStatus() {
   Serial.print("Mode: ");
-  switch (mode) {
-    case MODE_MANUAL: Serial.print("MANUAL"); break;
-    case MODE_TORQUE: Serial.print("TORQUE"); break;
-    case MODE_RPM:    Serial.print("RPM");    break;
-    case MODE_CVT:    Serial.print("CVT");    break;
-    default:          Serial.print("UNKNOWN"); break;
-  }
+  Serial.print(modeToStr(mode));
   Serial.print(" | BLE: "); Serial.print(g_bleClientConnected ? "CONNECTED" : "WAITING");
   Serial.print(" | E-RPM: "); Serial.print(engineRpm, 0);
   Serial.print("/"); Serial.print(targetEngineRpm, 0);
@@ -615,14 +697,22 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(pumpPulseSensor), pumpMagRead, RISING);
 
   scale.begin(DOUT, CLK);
-  scaleConnected = scale.is_ready();
-  if (scaleConnected) {
+  bool hxReady = scale.is_ready();
+  if (hxReady) {
     scale.set_scale(scaleFactor);
     scale.tare();
     Serial.println("HX711 ready.");
   } else {
-    Serial.println("HX711 not detected - torque mode will stay disabled.");
+    Serial.println("HX711 not detected - using fake torque if test mode is enabled.");
   }
+
+#if FAKE_TELEMETRY_TEST
+  scaleConnected = true;
+  fakePreviousMs = millis();
+  Serial.println("[TEST] Fake telemetry mode ENABLED");
+#else
+  scaleConnected = hxReady;
+#endif
 
   setupBle();
   colorSet(scaleConnected ? GREEN : YELLOW);
@@ -635,6 +725,26 @@ void loop() {
 
   const unsigned long now = millis();
 
+#if FAKE_TELEMETRY_TEST
+  if (now - sensorPreviousMillis >= SENSOR_PERIOD_MS) {
+    float dt = (now - fakePreviousMs) / 1000.0f;
+    if (dt <= 0.0f) dt = SENSOR_PERIOD_MS / 1000.0f;
+    fakePreviousMs = now;
+    sensorPreviousMillis = now;
+
+    if (mode != MODE_MANUAL) {
+      engineRpmControl();
+    }
+    pumpControl();
+    updateFakeTelemetry(dt);
+
+    digitalWrite(flowValveEnablePin, (mode == MODE_MANUAL || mode == MODE_TORQUE || mode == MODE_RPM || mode == MODE_CVT) ? HIGH : LOW);
+    digitalWrite(pressureValveEnablePin, (mode == MODE_MANUAL || mode == MODE_TORQUE) ? HIGH : LOW);
+    ledcWrite(flowValvePin, (uint32_t)flowValveValue);
+    ledcWrite(pressureValvePin, (uint32_t)pressureValveValue);
+    engineThrottle.writeMicroseconds((int)engineThrottleValue);
+  }
+#else
   if (now - sensorPreviousMillis >= SENSOR_PERIOD_MS) {
     sensorPreviousMillis = now;
     getEngineRpm();
@@ -643,9 +753,12 @@ void loop() {
     updateDerivedValues();
   }
 
-  engineRpmControl();
+  if (mode != MODE_MANUAL) {
+    engineRpmControl();
+  }
   pumpControl();
   updateDerivedValues();
+#endif
 
   if (now - blePreviousMillis >= BLE_TELEMETRY_PERIOD_MS) {
     blePreviousMillis = now;
@@ -657,3 +770,5 @@ void loop() {
     printStatus();
   }
 }
+
+// FAKE VALUES GENERATED WHEN FAKE_TELEMETRY_TEST == 1
