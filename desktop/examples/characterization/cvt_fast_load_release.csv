@@ -1,0 +1,8 @@
+# profile_name=CVT Fast Load and Release
+# actuator=pressure
+# target=torque
+# units=metric
+stage,target,transition_s,hold_s,throttle_pct,throttle_transition_s,group,group_repeats,record,notes
+Baseline,5,2.0,3.0,70,1.0,pulse,5,true,
+Fast load,55,0.10,2.0,70,0.0,pulse,5,true,Pressure valve applies torque rapidly
+Fast release,5,0.10,3.0,70,0.0,pulse,5,true,Pressure valve releases torque rapidly

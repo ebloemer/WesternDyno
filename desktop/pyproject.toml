@@ -1,0 +1,16 @@
+[project]
+name = "western-dyno-desktop"
+version = "0.2.0"
+description = "Bluetooth control and test analysis for the Western hydraulic dynamometer"
+requires-python = ">=3.11"
+dependencies = [
+    "bleak==3.0.2",
+    "PySide6==6.11.2",
+]
+
+[project.optional-dependencies]
+test = ["pytest==9.1.1"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

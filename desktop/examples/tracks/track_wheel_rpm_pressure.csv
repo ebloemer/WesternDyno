@@ -1,0 +1,11 @@
+# profile_name=Wheel RPM Track - Pressure Control
+# actuator=pressure
+# target=wheel_rpm
+# units=metric
+time_s,target,throttle_pct,notes
+0,0,0,Start
+2,80,55,
+7,180,100,
+12,120,30,Corner
+18,230,100,Straight
+25,0,0,Finish
